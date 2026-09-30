@@ -1,114 +1,278 @@
 import { createClient, Client } from '@libsql/client';
+import mysql from 'mysql2/promise';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import dotenv from 'dotenv';
 import { PADEL_TOURNAMENTS_DATA, FullTournamentDetail } from '../data/padelProTournamentsData';
 import { DEFAULT_CLUB_MEMBERS, ClubMember } from '../data/clubMembersStorage';
 import { DEFAULT_REFEREE_STATE, RefereeScoringState } from '../data/refereeStorage';
 import { getDefaultTournamentGroups, PoolGroupData } from '../data/tournamentGroupStorage';
 import { getStoredBracket, KnockoutBracketData } from '../data/bracketStorage';
 
+// Load environment variables from .env
+dotenv.config();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DB_FILE_PATH = path.resolve(__dirname, '../../padel_database.sqlite');
 
-let dbClient: Client | null = null;
+export interface DbResult {
+  rows: Array<Record<string, any>>;
+}
 
-export function getDb(): Client {
-  if (!dbClient) {
-    dbClient = createClient({
+export interface DbClient {
+  execute(query: string | { sql: string; args?: any[] }): Promise<DbResult>;
+  type: 'mysql' | 'sqlite';
+}
+
+class MySqlClientWrapper implements DbClient {
+  type: 'mysql' = 'mysql';
+  constructor(public pool: mysql.Pool) {}
+
+  async execute(query: string | { sql: string; args?: any[] }): Promise<DbResult> {
+    const rawSql = typeof query === 'string' ? query : query.sql;
+    const args = typeof query === 'string' ? [] : query.args || [];
+
+    // Normalize SQLite queries for MySQL dialect
+    let sql = rawSql.replace(/INSERT\s+OR\s+REPLACE\s+INTO/gi, 'REPLACE INTO');
+    sql = sql.replace(/\bsystem_meta\s*\(\s*key\b/gi, 'system_meta (`key`');
+    sql = sql.replace(/\bSELECT\s+key\b/gi, 'SELECT `key`');
+    sql = sql.replace(/\bWHERE\s+key\s*=/gi, 'WHERE `key` =');
+
+    const [result] = await this.pool.query(sql, args);
+    if (Array.isArray(result)) {
+      return { rows: result as Array<Record<string, any>> };
+    }
+    return { rows: [] };
+  }
+}
+
+class SqliteClientWrapper implements DbClient {
+  type: 'sqlite' = 'sqlite';
+  constructor(public client: Client) {}
+
+  async execute(query: string | { sql: string; args?: any[] }): Promise<DbResult> {
+    const res = await this.client.execute(query);
+    return { rows: (res.rows || []) as Array<Record<string, any>> };
+  }
+}
+
+let sqliteClient: Client | null = null;
+function getSqliteClient(): Client {
+  if (!sqliteClient) {
+    sqliteClient = createClient({
       url: `file:${DB_FILE_PATH}`
     });
   }
-  return dbClient;
+  return sqliteClient;
+}
+
+let activeDb: DbClient | null = null;
+
+export function getDb(): DbClient {
+  if (!activeDb) {
+    activeDb = new SqliteClientWrapper(getSqliteClient());
+  }
+  return activeDb;
 }
 
 /**
- * Initializes SQLite schema and seeds default data if tables are empty.
+ * Initializes database (MySQL with Hostinger credentials, or SQLite fallback).
  */
 export async function initDatabase(): Promise<void> {
+  const dbType = process.env.DB_TYPE || 'mysql';
+  const dbHost = process.env.DB_HOST || 'localhost';
+  const dbPort = Number(process.env.DB_PORT) || 3306;
+  const dbName = process.env.DB_NAME || 'u372224362_llp';
+  const dbUser = process.env.DB_USER || 'u372224362_llp_root';
+  const dbPassword = process.env.DB_PASSWORD || 'EzBdK~1u';
+
+  // 1. Attempt connection to MySQL with user hosting credentials
+  if (dbType === 'mysql') {
+    try {
+      console.log(`[Database] Attempting MySQL connection (User: ${dbUser}, DB: ${dbName}, Host: ${dbHost}:${dbPort})...`);
+      const pool = mysql.createPool({
+        host: dbHost,
+        port: dbPort,
+        user: dbUser,
+        password: dbPassword,
+        database: dbName,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        connectTimeout: 3000
+      });
+
+      const connection = await pool.getConnection();
+      connection.release();
+
+      activeDb = new MySqlClientWrapper(pool);
+      console.log(`[Database] ✅ MySQL connected successfully! Using database "${dbName}" (${dbUser}).`);
+    } catch (err: any) {
+      console.warn(`[Database] MySQL not reachable on ${dbHost}:${dbPort} (${err.code || err.message}).`);
+      console.warn(`[Database] Registered hosting credentials: DB="${dbName}", User="${dbUser}". Active on SQLite for local development.`);
+      activeDb = new SqliteClientWrapper(getSqliteClient());
+    }
+  } else {
+    activeDb = new SqliteClientWrapper(getSqliteClient());
+  }
+
   const db = getDb();
 
-  // Create tables
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS tournaments (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      status TEXT NOT NULL,
-      category TEXT,
-      date TEXT,
-      location TEXT,
-      total_prize TEXT,
-      data TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
+  // Create tables according to active DB dialect
+  if (db.type === 'mysql') {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tournaments (
+        id VARCHAR(191) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        status VARCHAR(64) NOT NULL,
+        category VARCHAR(255),
+        date VARCHAR(64),
+        location VARCHAR(255),
+        total_prize VARCHAR(255),
+        data LONGTEXT NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS members (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      nickname TEXT,
-      photo_url TEXT,
-      phone TEXT,
-      email TEXT,
-      club TEXT,
-      city TEXT,
-      rating TEXT,
-      gender TEXT,
-      membership_tier TEXT,
-      joined_date TEXT,
-      status TEXT,
-      is_group_qualified INTEGER DEFAULT 0,
-      qualified_tournament TEXT,
-      qualified_pool TEXT,
-      qualified_phase TEXT,
-      achievements TEXT,
-      updated_at TEXT NOT NULL
-    );
-  `);
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS members (
+        id VARCHAR(191) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        nickname VARCHAR(255),
+        photo_url TEXT,
+        phone VARCHAR(64),
+        email VARCHAR(191),
+        club VARCHAR(255),
+        city VARCHAR(255),
+        rating VARCHAR(64),
+        gender VARCHAR(64),
+        membership_tier VARCHAR(64),
+        joined_date VARCHAR(64),
+        status VARCHAR(64),
+        is_group_qualified INT DEFAULT 0,
+        qualified_tournament VARCHAR(255),
+        qualified_pool VARCHAR(64),
+        qualified_phase VARCHAR(64),
+        achievements TEXT,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS tournament_groups (
-      tournament_id TEXT PRIMARY KEY,
-      pools_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tournament_groups (
+        tournament_id VARCHAR(191) PRIMARY KEY,
+        pools_json LONGTEXT NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS brackets (
-      tournament_id TEXT PRIMARY KEY,
-      bracket_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS brackets (
+        tournament_id VARCHAR(191) PRIMARY KEY,
+        bracket_json LONGTEXT NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS referee_state (
-      id TEXT PRIMARY KEY,
-      state_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS referee_state (
+        id VARCHAR(191) PRIMARY KEY,
+        state_json LONGTEXT NOT NULL,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
 
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS system_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT,
-      updated_at TEXT NOT NULL
-    );
-  `);
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS system_meta (
+        \`key\` VARCHAR(191) PRIMARY KEY,
+        value LONGTEXT,
+        updated_at VARCHAR(64) NOT NULL
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+  } else {
+    // SQLite schema
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tournaments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        category TEXT,
+        date TEXT,
+        location TEXT,
+        total_prize TEXT,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS members (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        nickname TEXT,
+        photo_url TEXT,
+        phone TEXT,
+        email TEXT,
+        club TEXT,
+        city TEXT,
+        rating TEXT,
+        gender TEXT,
+        membership_tier TEXT,
+        joined_date TEXT,
+        status TEXT,
+        is_group_qualified INTEGER DEFAULT 0,
+        qualified_tournament TEXT,
+        qualified_pool TEXT,
+        qualified_phase TEXT,
+        achievements TEXT,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS tournament_groups (
+        tournament_id TEXT PRIMARY KEY,
+        pools_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS brackets (
+        tournament_id TEXT PRIMARY KEY,
+        bracket_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS referee_state (
+        id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS system_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT NOT NULL
+      );
+    `);
+  }
 
   // Check if we need to seed
   const tourneyCount = await db.execute('SELECT COUNT(*) as cnt FROM tournaments');
   const count = Number(tourneyCount.rows[0]?.cnt || 0);
 
   if (count === 0) {
-    console.log('[SQLite] Empty database detected. Seeding initial tournaments, members, brackets, and groups...');
+    console.log(`[Database (${db.type})] Empty database detected. Seeding initial tournaments, members, brackets, and groups...`);
     await seedDefaultData();
   } else {
-    console.log(`[SQLite] Database initialized. Loaded with ${count} tournaments.`);
+    console.log(`[Database (${db.type})] Initialized. Loaded with ${count} tournaments.`);
     await syncAllDataWithMembers();
   }
 }
